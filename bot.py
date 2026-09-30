@@ -44,7 +44,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     targets[q.from_user.id] = int(q.data.split(":")[1])
     await q.message.reply_text("Напиши ответ — следующее сообщение улетит анонимно этому человеку.")
-
+ 
 def run_flask():
     flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
