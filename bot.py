@@ -1,53 +1,163 @@
-import os, asyncio
+import os
+import logging
+import threading
+import asyncio
 from flask import Flask
-from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+# Логи
+logging.basicConfig(level=logging.INFO)
 
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def home(): return "Anon 71 bot alive!"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
 
-targets = {}
+if not BOT_TOKEN or not CHANNEL_ID:
+    raise ValueError("BOT_TOKEN и CHANNEL_ID должны быть заданы!")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Это анонимка 71 школы. Просто напиши сюда — улетит в канал анонимно.")
+# Flask для Render - теперь отдает 0 байт, чтобы cron-job не ругался
+app = Flask(__name__)
 
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update.effective_user.id == ADMIN_ID and ADMIN_ID in targets:
-            tid = targets.pop(ADMIN_ID)
-            await context.bot.send_message(tid, f"💬 Ответ из 71 школы:\n\n{update.message.text}")
-            await update.message.reply_text("✅ Ответ отправлен")
-            return
-        txt = update.message.text
-        await context.bot.send_message(CHANNEL_ID, f"📩 Аноним 71:\n\n{txt}")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Ответить", callback_data=f"r:{update.effective_user.id}")]])
-        await context.bot.send_message(ADMIN_ID, f"📩 Аноним 71:\n\n{txt}\n\nID: <code>{update.effective_user.id}</code>", parse_mode="HTML", reply_markup=kb)
-        await update.message.reply_text("✅ Отправлено анонимно!")
-    except Exception as e:
-        print(f"ERROR: {e}")
+@app.route('/')
+def home():
+    return '', 204
 
-async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    targets[q.from_user.id] = int(q.data.split(":")[1])
-    await q.message.reply_text("Напиши ответ — следующее сообщение улетит анонимно.")
+@app.route('/ping')
+def ping():
+    return 'ok', 200
 
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host='0.0.0.0', port=port)
 
-if __name__ == "__main__":
-    # Фикс для Render: создаем event loop для бота
+# Telegram Bot
+application = Application.builder().token(BOT_TOKEN).build()
+
+# Хранилище
+pending_posts = {}
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text or update.message.caption or ""
+
+    # Определяем что прислал
+    file_id = None
+    content_type = "text"
+
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        content_type = "photo"
+    elif update.message.video:
+        file_id = update.message.video.file_id
+        content_type = "video"
+    elif update.message.sticker:
+        file_id = update.message.sticker.file_id
+        content_type = "sticker"
+
+    # Сохраняем
+    msg_id = update.message.message_id
+    pending_posts[msg_id] = {
+        "text": text,
+        "file_id": file_id,
+        "type": content_type,
+        "user_id": user.id,
+        "username": user.username
+    }
+
+    # Кнопки админу
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{msg_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{msg_id}")
+        ]
+    ]
+
+    preview = f"📩 Новая анонимка (ID: {msg_id})\nОт: @{user.username or user.id}\n\n"
+    if text:
+        preview += f"{text[:1000]}"
+    else:
+        preview += f"[{content_type}]"
+
+    try:
+        if content_type == "photo":
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=file_id,
+                caption=preview,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        elif content_type == "video":
+            await context.bot.send_video(
+                chat_id=ADMIN_ID,
+                video=file_id,
+                caption=preview,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=preview,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        await update.message.reply_text("✅ Отправлено на модерацию! Скоро появится в канале.")
+    except Exception as e:
+        logging.error(f"Ошибка отправки админу: {e}")
+        await update.message.reply_text("❌ Ошибка, попробуй позже.")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    msg_id = int(data.split("_")[1])
+    post = pending_posts.get(msg_id)
+
+    if not post:
+        await query.edit_message_text("❌ Пост уже удален или не найден.")
+        return
+
+    if data.startswith("approve_"):
+        try:
+            if post["type"] == "photo":
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=post["file_id"],
+                    caption=post["text"] if post["text"] else None
+                )
+            elif post["type"] == "video":
+                await context.bot.send_video(
+                    chat_id=CHANNEL_ID,
+                    video=post["file_id"],
+                    caption=post["text"] if post["text"] else None
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=post["text"]
+                )
+
+            await query.edit_message_caption(caption=f"✅ Одобрено и выложено в канал.\n\n{query.message.caption}") if post["type"] in ["photo","video"] else await query.edit_message_text(f"✅ Одобрено и выложено в канал.\n\n{query.message.text}")
+            del pending_posts[msg_id]
+        except Exception as e:
+            logging.error(f"Ошибка публикации: {e}")
+            await query.edit_message_text(f"❌ Ошибка публикации: {e}")
+
+    elif data.startswith("reject_"):
+        del pending_posts[msg_id]
+        await query.edit_message_text(f"❌ Отклонено.\n\n{query.message.text or query.message.caption}")
+
+application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+application.add_handler(CallbackQueryHandler(handle_callback))
+
+# Запуск бота в отдельном потоке (фикс для Render)
+def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    Thread(target=run_flask, daemon=True).start()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(btn, pattern="^r:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.run_polling()
+    loop.run_until_complete(application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False))
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    logging.info("Flask запущен, запускаем бота...")
+    run_bot()
